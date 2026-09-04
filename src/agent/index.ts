@@ -1109,15 +1109,18 @@ export function createModel(
       : {};
 
   if (provider === "gemini") {
-    return new ChatGoogle({
-      apiKey: getProviderApiKey(provider),
-      model: modelId,
-      platformType: "gai",
-      // Gemini 3.x thought-signature round-trip; see the constant's comment.
-      ...GEMINI_THOUGHT_SIGNATURE_OPTIONS,
-      ...googleMaxOutputTokensOptions,
-      ...retryOptions,
-    });
+    const apiKeys = getGeminiApiKeys();
+    return createRoundRobinGeminiModel(
+      {
+        model: modelId,
+        platformType: "gai",
+        // Gemini 3.x thought-signature round-trip; see the constant's comment.
+        ...GEMINI_THOUGHT_SIGNATURE_OPTIONS,
+        ...googleMaxOutputTokensOptions,
+        ...retryOptions,
+      },
+      apiKeys,
+    );
   }
 
   if (provider === "gemini-enterprise") {
@@ -1277,6 +1280,122 @@ function getProviderApiKey(provider: OpenWikiProvider): string | undefined {
   const apiKeyEnvKey = getProviderApiKeyEnvKey(provider);
 
   return apiKeyEnvKey ? process.env[apiKeyEnvKey] : undefined;
+}
+
+function getGeminiApiKeys(): string[] {
+  const keys: string[] = [];
+  const candidateKeys = [
+    "GEMINI_API_KEY",
+    "GEMINI_API_KEY_1",
+    "GEMINI_API_KEY_2",
+    "GEMINI_API_KEY_3",
+    "GEMINI_API_KEY_4",
+    "GEMINI_API_KEY_5",
+  ];
+  for (const k of candidateKeys) {
+    const val = process.env[k];
+    if (val && val.trim().length > 0 && !keys.includes(val.trim())) {
+      keys.push(val.trim());
+    }
+  }
+  if (keys.length === 0) {
+    const fallback = getProviderApiKey("gemini");
+    if (fallback && fallback.trim().length > 0) {
+      keys.push(fallback.trim());
+    }
+  }
+  return keys;
+}
+
+function createRoundRobinGeminiModel(
+  baseOptions: Record<string, any>,
+  apiKeys: string[],
+): any {
+  if (apiKeys.length === 0) {
+    return new ChatGoogle({
+      ...baseOptions,
+      apiKey: undefined,
+    });
+  }
+
+  if (apiKeys.length === 1) {
+    return new ChatGoogle({
+      ...baseOptions,
+      apiKey: apiKeys[0],
+    });
+  }
+
+  const models = apiKeys.map(
+    (key) =>
+      new ChatGoogle({
+        ...baseOptions,
+        apiKey: key,
+      }),
+  );
+
+  let currentIndex = 0;
+
+  function wrapModel(modelInstance: any): any {
+    return new Proxy(modelInstance, {
+      get(target, prop, receiver) {
+        if (
+          prop === "invoke" ||
+          prop === "stream" ||
+          prop === "batch" ||
+          prop === "generate"
+        ) {
+          const m = models[currentIndex];
+          currentIndex = (currentIndex + 1) % models.length;
+          const method = m[prop];
+          if (typeof method === "function") {
+            return method.bind(m);
+          }
+          return method;
+        }
+
+        if (prop === "bindTools") {
+          return (...args: any[]) => {
+            const boundModels = models.map((m) => m.bindTools(...args));
+            let boundIndex = 0;
+            const boundProxyTarget = boundModels[0];
+            return new Proxy(boundProxyTarget, {
+              get(bTarget, bProp, bReceiver) {
+                if (
+                  bProp === "invoke" ||
+                  bProp === "stream" ||
+                  bProp === "batch" ||
+                  bProp === "generate"
+                ) {
+                  const bm = boundModels[boundIndex];
+                  boundIndex = (boundIndex + 1) % boundModels.length;
+                  const bMethod = bm[bProp];
+                  if (typeof bMethod === "function") {
+                    return bMethod.bind(bm);
+                  }
+                  return bMethod;
+                }
+                const bm = boundModels[boundIndex];
+                const val = Reflect.get(bm, bProp, bReceiver);
+                if (typeof val === "function") {
+                  return val.bind(bm);
+                }
+                return val;
+              },
+            });
+          };
+        }
+
+        const m = models[currentIndex];
+        const value = Reflect.get(m, prop, receiver);
+        if (typeof value === "function") {
+          return value.bind(m);
+        }
+        return value;
+      },
+    });
+  }
+
+  return wrapModel(models[0]);
 }
 
 // Placeholder OpenAI API key for the Vertex MaaS surface; overwritten per
